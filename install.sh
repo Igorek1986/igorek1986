@@ -1,182 +1,82 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
 
-function error { echo -e "[Error] $*"; exit 1; }
-function warn  { echo -e "[Warning] $*"; }
+VERSION=${VERSION:-v19.07.5-20201217}
 
-warn ""
-warn "Optimized by Igor"
-warn ""
+SYSUP_URL=https://github.com/openlumi/openwrt/releases/download/$VERSION/openwrt-imx6-lumi-squashfs-sysupgrade.bin
+DTB_URL=https://github.com/openlumi/openwrt/releases/download/$VERSION/openwrt-imx6-imx6ull-xiaomi-lumi.dtb
+UTILS_HOST=raw.githubusercontent.com
+UTILS_URL=/openlumi/owrt-installer/main/curl
+UPDATE_URL=/openlumi/owrt-installer/main/update.sh
+PKG=/tmp/m.tar
+KERNEL=kernel
+DTB=lumi.dtb
+SQUASHFS=rootfs.squashfs
 
-ARCH=$(uname -m)
-DOCKER_BINARY=/usr/bin/docker
-DOCKER_REPO=homeassistant
-DOCKER_SERVICE=docker.service
-URL_VERSION="https://version.home-assistant.io/stable.json"
-URL_HA="https://raw.githubusercontent.com/home-assistant/supervised-installer/master/files/ha"
-URL_BIN_HASSIO="https://raw.githubusercontent.com/home-assistant/supervised-installer/master/files/hassio-supervisor"
-URL_BIN_APPARMOR="https://raw.githubusercontent.com/home-assistant/supervised-installer/master/files/hassio-apparmor"
-URL_SERVICE_HASSIO="https://raw.githubusercontent.com/home-assistant/supervised-installer/master/files/hassio-supervisor.service"
-URL_SERVICE_APPARMOR="https://raw.githubusercontent.com/home-assistant/supervised-installer/master/files/hassio-apparmor.service"
-URL_APPARMOR_PROFILE="https://version.home-assistant.io/apparmor.txt"
-
-# Check env
-command -v systemctl > /dev/null 2>&1 || error "Only systemd is supported!"
-command -v docker > /dev/null 2>&1 || error "Please install docker first"
-command -v jq > /dev/null 2>&1 || error "Please install jq first"
-command -v curl > /dev/null 2>&1 || error "Please install curl first"
-command -v avahi-daemon > /dev/null 2>&1 || error "Please install avahi first"
-command -v dbus-daemon > /dev/null 2>&1 || error "Please install dbus first"
-command -v nmcli > /dev/null 2>&1 || error "No NetworkManager support on host."
-command -v apparmor_parser > /dev/null 2>&1 || error "No AppArmor support on host."
-
-
-# Check if Modem Manager is enabled
-if systemctl list-unit-files ModemManager.service | grep enabled; then
-    warn "ModemManager service is enabled. This might cause issue when using serial devices."
-fi
-
-# Detect if running on snapped docker
-if snap list docker >/dev/null 2>&1; then
-    DOCKER_BINARY=/snap/bin/docker
-    DATA_SHARE=/root/snap/docker/common/hassio
-    CONFIG=$DATA_SHARE/hassio.json
-    DOCKER_SERVICE="snap.docker.dockerd.service"
-fi
-
-# Parse command line parameters
-while [[ $# -gt 0 ]]; do
-    arg="$1"
-
-    case $arg in
-        -m|--machine)
-            MACHINE=$2
-            shift
-            ;;
-        -d|--data-share)
-            DATA_SHARE=$2
-            shift
-            ;;
-        -p|--prefix)
-            PREFIX=$2
-            shift
-            ;;
-        -s|--sysconfdir)
-            SYSCONFDIR=$2
-            shift
-            ;;
-        *)
-            error "Unrecognized option $1"
-            ;;
-    esac
-    shift
-done
-
-PREFIX=${PREFIX:-/usr}
-SYSCONFDIR=${SYSCONFDIR:-/etc}
-DATA_SHARE=${DATA_SHARE:-$PREFIX/share/hassio}
-CONFIG=$SYSCONFDIR/hassio.json
-
-# Generate hardware options
-case $ARCH in
-    "i386" | "i686")
-        MACHINE=${MACHINE:=qemux86}
-        HASSIO_DOCKER="$DOCKER_REPO/i386-hassio-supervisor"
-    ;;
-    "x86_64")
-        MACHINE=${MACHINE:=qemux86-64}
-        HASSIO_DOCKER="$DOCKER_REPO/amd64-hassio-supervisor"
-    ;;
-    "arm" |"armv6l")
-        if [ -z $MACHINE ]; then
-            error "Please set machine for $ARCH"
-        fi
-        HASSIO_DOCKER="$DOCKER_REPO/armhf-hassio-supervisor"
-    ;;
-    "armv7l")
-        if [ -z $MACHINE ]; then
-            error "Please set machine for $ARCH"
-        fi
-        HASSIO_DOCKER="$DOCKER_REPO/armv7-hassio-supervisor"
-    ;;
-    "aarch64")
-        if [ -z $MACHINE ]; then
-            error "Please set machine for $ARCH"
-        fi
-        HASSIO_DOCKER="$DOCKER_REPO/aarch64-hassio-supervisor"
-    ;;
-    *)
-        error "$ARCH unknown!"
-    ;;
-esac
-
-### Main
-
-# Init folders
-if [ ! -d "$DATA_SHARE" ]; then
-    mkdir -p "$DATA_SHARE"
-fi
-
-# Read infos from web
-HASSIO_VERSION=$(curl -s $URL_VERSION | jq -e -r '.supervisor')
-
-##
-# Write configuration
-cat > "$CONFIG" <<- EOF
-{
-    "supervisor": "${HASSIO_DOCKER}",
-    "machine": "${MACHINE}",
-    "data": "${DATA_SHARE}"
+w_get() {
+    echo -e "GET $2 HTTP/1.0\nHost: $1\n" | openssl s_client -quiet -connect $1:443 2>/dev/null | sed '1,/^\r$/d' > $3
 }
-EOF
 
-##
-# Pull supervisor image
-echo "[Info] Install supervisor Docker container"
-docker pull "$HASSIO_DOCKER:$HASSIO_VERSION" > /dev/null
-docker tag "$HASSIO_DOCKER:$HASSIO_VERSION" "$HASSIO_DOCKER:latest" > /dev/null
+echo =================================================================
+echo OpenWRT automatic installer
+echo =================================================================
 
-##
-# Install Hass.io Supervisor
-echo "[Info] Install supervisor startup scripts"
-curl -sL ${URL_BIN_HASSIO} > "${PREFIX}/sbin/hassio-supervisor"
-curl -sL ${URL_SERVICE_HASSIO} > "${SYSCONFDIR}/systemd/system/hassio-supervisor.service"
-
-sed -i "s,%%HASSIO_CONFIG%%,${CONFIG},g" "${PREFIX}"/sbin/hassio-supervisor
-sed -i -e "s,%%DOCKER_BINARY%%,${DOCKER_BINARY},g" \
-       -e "s,%%DOCKER_SERVICE%%,${DOCKER_SERVICE},g" \
-       -e "s,%%HASSIO_BINARY%%,${PREFIX}/sbin/hassio-supervisor,g" \
-       "${SYSCONFDIR}/systemd/system/hassio-supervisor.service"
-
-chmod a+x "${PREFIX}/sbin/hassio-supervisor"
-systemctl enable hassio-supervisor.service
-
-#
-# Install Hass.io AppArmor
-if command -v apparmor_parser > /dev/null 2>&1; then
-    echo "[Info] Install AppArmor scripts"
-    mkdir -p "${DATA_SHARE}/apparmor"
-    curl -sL ${URL_BIN_APPARMOR} > "${PREFIX}/sbin/hassio-apparmor"
-    curl -sL ${URL_SERVICE_APPARMOR} > "${SYSCONFDIR}/systemd/system/hassio-apparmor.service"
-    curl -sL ${URL_APPARMOR_PROFILE} > "${DATA_SHARE}/apparmor/hassio-supervisor"
-
-    sed -i "s,%%HASSIO_CONFIG%%,${CONFIG},g" "${PREFIX}/sbin/hassio-apparmor"
-    sed -i -e "s,%%DOCKER_SERVICE%%,${DOCKER_SERVICE},g" \
-	   -e "s,%%HASSIO_APPARMOR_BINARY%%,${PREFIX}/sbin/hassio-apparmor,g" \
-	   "${SYSCONFDIR}/systemd/system/hassio-apparmor.service"
-
-    chmod a+x "${PREFIX}/sbin/hassio-apparmor"
-    systemctl enable hassio-apparmor.service
-    systemctl start hassio-apparmor.service
+# Sanity checks first
+if [ ! -d "/lumi" ]; then
+    echo
+    echo Only STOCK firmware supported. Please try another upgrade path.
+    exit -1
 fi
 
-##
-# Init system
-echo "[Info] Run Home Assistant Supervised"
-systemctl start hassio-supervisor.service
+#if lsmod | grep 8189es >/dev/null; then
+#    echo
+#    echo WiFi module 8189es is not supported by OpenWRT yet.
+#    exit -1
+#fi
 
-##
-# Setup CLI
-echo "[Info] Install cli 'ha'"
-curl -sL ${URL_HA} > "${PREFIX}/bin/ha"
-chmod a+x "${PREFIX}/bin/ha"
+echo
+echo Updating time...
+ntpdate pool.ntp.org
+
+echo
+echo Downloading curl...
+WORKDIR=$(mktemp -d)
+w_get $UTILS_HOST $UTILS_URL $WORKDIR/curl
+chmod +x $WORKDIR/curl
+
+echo
+echo Downloading DTB...
+$WORKDIR/curl -L -o $WORKDIR/$DTB $DTB_URL
+if [ ! -s $WORKDIR/$DTB ]; then
+    echo Download failed, please check available space and try again.
+    exit -1
+fi
+
+echo
+echo Downloading SysUpgrade package...
+$WORKDIR/curl -L -o $PKG $SYSUP_URL
+if ! tar -xvf $PKG -C $WORKDIR; then
+    echo Unpacking failed, please check available space and try again.
+    exit -1
+fi
+rm $PKG
+mv $WORKDIR/sysupgrade-*/kernel $WORKDIR/$KERNEL
+mv $WORKDIR/sysupgrade-*/root $WORKDIR/$SQUASHFS
+rm -rf $WORKDIR/sysupgrade-*
+
+echo
+echo Downloading upgrade script...
+$WORKDIR/curl -L -o $WORKDIR/update.sh https://$UTILS_HOST$UPDATE_URL
+if [ ! -s $WORKDIR/update.sh ]; then
+    echo Download failed, please check available space and try again.
+    exit -1
+fi
+chmod +x $WORKDIR/update.sh
+
+echo
+echo =================================================================
+echo Last chance!!! Stock OS would be replaced with OpenWRT. 
+echo You have 15 seconds. Press Ctrl+C to cancel.
+echo =================================================================
+sleep 15
+
+setsid $WORKDIR/update.sh $WORKDIR/$DTB $WORKDIR/$KERNEL $WORKDIR/$SQUASHFS >/dev/ttymxc0 2>&1 < /dev/null &
